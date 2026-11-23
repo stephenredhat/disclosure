@@ -35,12 +35,12 @@ __version__ = "0.1.0"
 # disclosure CLI exit codes (see the root command's --help):
 #   0 = no AI detected, 1 = AI detected, 2 = error.
 # Codes 0 and 1 are both successful scans that emit a valid report on stdout;
-# only code 2 (and above) signals a real failure.
+# all other codes, including signal termination, indicate a failure.
 _EXIT_ERROR = 2
 
 
 class DisclosureError(RuntimeError):
-    """Raised when the disclosure CLI reports an error (exit code >= 2)."""
+    """Raised when disclosure exits with an error or is terminated by a signal."""
 
     def __init__(self, returncode: int, stderr: str) -> None:
         super().__init__(f"disclosure exited with code {returncode}: {stderr.strip()}")
@@ -54,13 +54,17 @@ def run(
     stdin: Optional[str] = None,
 ) -> subprocess.CompletedProcess:
     """Run the disclosure binary with ``args`` and return the completed process."""
-    proc = subprocess.run(
-        [str(binary_path()), *args],
-        input=stdin,
-        capture_output=True,
-        text=True,
-    )
-    if proc.returncode >= _EXIT_ERROR:
+    binary = binary_path()
+    try:
+        proc = subprocess.run(
+            [str(binary), *args],
+            input=stdin,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        raise BinaryResolutionError(f"cannot run {binary}: {exc}") from exc
+    if proc.returncode < 0 or proc.returncode >= _EXIT_ERROR:
         raise DisclosureError(proc.returncode, proc.stderr)
     return proc
 

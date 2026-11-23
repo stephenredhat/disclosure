@@ -10,8 +10,11 @@ avoids any download at runtime.
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import platform
+import re
+import shutil
 import stat
 import tarfile
 import tempfile
@@ -67,9 +70,9 @@ def _binary_name(goos: str) -> str:
 
 def _download(url: str) -> bytes:
     try:
-        with urllib.request.urlopen(url) as resp:  # noqa: S310 (trusted GitHub host)
+        with urllib.request.urlopen(url, timeout=30) as resp:  # noqa: S310 (trusted GitHub host)
             return resp.read()
-    except Exception as exc:  # pragma: no cover - network failure path
+    except Exception as exc:
         raise BinaryResolutionError(f"failed to download {url}: {exc}") from exc
 
 
@@ -84,11 +87,16 @@ def _expected_sha256(goos: str, goarch: str) -> str:
         version=DISCLOSURE_VERSION, asset="checksums.txt"
     )
     archive = f"disclosure_{DISCLOSURE_VERSION}_{goos}_{goarch}.tar.gz"
-    text = _download(url).decode("utf-8")
+    try:
+        text = _download(url).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise BinaryResolutionError("checksums.txt is not valid UTF-8") from exc
     for line in text.splitlines():
         parts = line.split()
         if len(parts) == 2 and parts[1] == archive:
-            return parts[0]
+            if not re.fullmatch(r"[0-9a-fA-F]{64}", parts[0]):
+                raise BinaryResolutionError(f"invalid SHA-256 checksum for {archive}")
+            return parts[0].lower()
     raise BinaryResolutionError(
         f"no checksum listed for {archive} in checksums.txt; "
         f"refusing to run an unverified binary"
@@ -111,17 +119,28 @@ def _fetch(goos: str, goarch: str, dest: Path) -> None:
         )
 
     name = _binary_name(goos)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory() as tmp:
-        tar_path = Path(tmp) / archive
-        tar_path.write_bytes(blob)
-        with tarfile.open(tar_path) as tf:
+    temporary = None
+    try:
+        with tarfile.open(fileobj=io.BytesIO(blob)) as tf:
             member = tf.getmember(name)
-            extracted = tf.extractfile(member)
-            if extracted is None:
-                raise BinaryResolutionError(f"{name} not found in {archive}")
-            dest.write_bytes(extracted.read())
-    dest.chmod(dest.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+            if not member.isfile() or member.size == 0:
+                raise BinaryResolutionError(f"{name} is not a non-empty regular file in {archive}")
+            with tf.extractfile(member) as extracted:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                # Stage in the destination directory so replacement stays on
+                # one filesystem. Never expose a partially written cache file.
+                with tempfile.NamedTemporaryFile(
+                    dir=dest.parent, prefix=f".{name}-", delete=False,
+                ) as output:
+                    temporary = Path(output.name)
+                    shutil.copyfileobj(extracted, output)
+            temporary.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+            os.replace(temporary, dest)
+    except (OSError, tarfile.TarError, KeyError) as exc:
+        raise BinaryResolutionError(f"failed to install {name}: {exc}") from exc
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def binary_path() -> Path:
@@ -132,6 +151,17 @@ def binary_path() -> Path:
     """
     goos, goarch = _target()
     path = _cache_dir() / _binary_name(goos)
-    if not path.exists():
-        _fetch(goos, goarch, path)
+    try:
+        # Do not follow a cache symlink or silently replace an unusable cache.
+        # Report its location so callers can remove it and retry deliberately.
+        if path.is_symlink():
+            raise BinaryResolutionError(f"cached binary {path} is a symlink; remove it and retry")
+        if not path.exists():
+            _fetch(goos, goarch, path)
+        if not path.is_file() or path.stat().st_size == 0:
+            raise BinaryResolutionError(f"cached binary {path} is not a non-empty regular file; remove it and retry")
+        if os.name != "nt" and not os.access(path, os.X_OK):
+            raise BinaryResolutionError(f"cached binary {path} is not executable; remove it and retry")
+    except OSError as exc:
+        raise BinaryResolutionError(f"cannot access cached binary {path}: {exc}") from exc
     return path

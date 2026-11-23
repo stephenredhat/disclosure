@@ -26,7 +26,7 @@ classifiers = [
 dependencies = []  # stdlib only, so the wrapper stays a single tiny universal wheel
 
 [project.optional-dependencies]
-test = ["pytest>=7"]
+test = ["pytest>=7", "pytest-cov>=4.1"]
 
 [project.urls]
 Homepage = "https://github.com/chaoss/disclosure"
@@ -37,3 +37,11 @@ disclosure = "disclosure.__main__:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/disclosure"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=disclosure --cov-branch --cov-report=term-missing --cov-fail-under=90"
+
+[tool.coverage.run]
+relative_files = true
+source = ["disclosure"]
